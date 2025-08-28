@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.build/
+.dist/
+.venv/
+venv/
+.env
+.env.*
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
+logs/
+*debug*.log
+
+# Notebooks/checkpoints
+.ipynb_checkpoints/
+
+# Local data/output
+*.csv
+*.tmp
+*.cache/
+.cache/
+
+# Credentials / secrets (DO NOT COMMIT)
+*.pem
+*.p12
+*.key
+*.crt
+*.der
+*.jks
+*.pfx
+*.keystore
+*.sqlite
+*.db
+*.token
+*.secrets
+*.credentials
+*.config
+*.ini
+*.cfg
+
+# Google credentials
+*.json
+!package.json
+lofty-mark-407721-c78e211dcebf.json
+
+# Ignore any other service-account-like files
+*service*account*.json
+*credentials*.json
+
+# Local overrides
+local.*.json
