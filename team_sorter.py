@@ -8,18 +8,8 @@ import pulp
 # Configuração do logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Autenticação com a conta de serviço
-SCOPES = [
-    'https://www.googleapis.com/auth/spreadsheets',
-    'https://www.googleapis.com/auth/drive'
-]
-
-creds = Credentials.from_service_account_file('lofty-mark-407721-c78e211dcebf.json', scopes=SCOPES)
-client = gspread.authorize(creds)
-
-# Abrir a planilha pelo ID e acessar a terceira aba
-spreadsheet = client.open_by_key('1GRC7L_2Q75OEywLz-gFU6jrcKLhpgA3-1LZ_qFviFsY')
-sheet = spreadsheet.get_worksheet(2)  # A terceira aba
+data = []  # Populated only when running as a script; keeps imports safe for tests
+sheet = None
 
 # Define the expected headers based on the unique columns you need
 expected_headers = [
@@ -28,27 +18,11 @@ expected_headers = [
     'MEDIA FORMS', 'NOVO FORMS MODA', 'Mensalista', 'Status', 'Fila Mensal'
 ]
 
-# Obter todos os dados da aba com expected_headers
-data = sheet.get_all_records(expected_headers=expected_headers)
-logging.debug("Dados da planilha carregados com sucesso com expected_headers.")
+if sheet is not None:
+    # Obter todos os dados da aba com expected_headers
+    data = sheet.get_all_records(expected_headers=expected_headers)
+    logging.debug("Dados da planilha carregados com sucesso com expected_headers.")
 
-# Helper to compute alpha weight for per-level distribution penalty
-def _compute_alpha_level_dist(player_levels, num_times, total_players):
-    """Choose a soft penalty weight based on the day's level distribution.
-
-    - Prioritize average equality elsewhere. Here we only tune tie-breaking across
-      solutions with similar z.
-    - Heuristic:
-      * If N=18 and each level count in [3,6] (well-spread for 3 teams): alpha=0.20
-      * Else if N<18 or any level extremely skewed (count <2 or >8): alpha=0.07
-      * Else: alpha=0.10
-    """
-    counts = {lvl: player_levels.count(lvl) for lvl in (1, 2, 3, 4)}
-    if total_players == 18 and all(3 <= c <= 6 for c in counts.values()):
-        return 0.20, counts
-    if total_players < 18 or any(c < 2 or c > 8 for c in counts.values()):
-        return 0.07, counts
-    return 0.10, counts
 
 # Função para buscar o nível e tipo de jogador
 def buscar_nivel_e_tipo(apelido):
@@ -95,104 +69,157 @@ def processar_lista_jogadores(filename):
     logging.info("Finished processing player list. %d players found.", len(jogadores_com_nivel))
     return jogadores_com_nivel
 
-def sortear_times(jogadores, num_times=3):
-    """Create balanced teams using CP-SAT exact optimization.
+def _compute_team_capacities(total_players, num_teams):
+    """Compute per-team capacities as equal as possible.
 
-    Keeps printed output identical, logs team averages and player levels per team,
-    and injects randomness to avoid input-order bias.
+    Example (3 teams):
+        15 -> [5,5,5]
+        16 -> [6,5,5]
+        17 -> [6,6,5]
+        18 -> [6,6,6]
     """
-    logging.info("Starting optimal team balancing with %d players.", len(jogadores))
+    base = total_players // num_teams
+    remainder = total_players % num_teams
+    capacities = [base + (1 if i < remainder else 0) for i in range(num_teams)]
+    return capacities
 
+
+def _build_balanced_teams(players, num_teams=3):
+    """Build teams with capacity constraints and per-level distribution.
+
+    Players are tuples: (name, level:int [1(best)-4(worst)], type)
+    Returns a list of teams (each a list of players), without printing or logging.
+    """
+    total_players = len(players)
+    capacities = _compute_team_capacities(total_players, num_teams)
+
+    teams = [[] for _ in range(num_teams)]
+    team_sizes = [0] * num_teams
+    team_sums = [0] * num_teams
+    per_level_counts = [{1: 0, 2: 0, 3: 0, 4: 0} for _ in range(num_teams)]
+
+    # Group players by level and shuffle within each bucket for randomness
+    by_level = {1: [], 2: [], 3: [], 4: []}
+    for p in players:
+        name, level, ptype = p
+        if level in by_level:
+            by_level[level].append(p)
+    for lvl in by_level:
+        random.shuffle(by_level[lvl])
+
+    # Target per-level distribution bounds for swap constraints
+    per_level_totals = {lvl: len(by_level[lvl]) for lvl in by_level}
+    per_level_low = {lvl: per_level_totals[lvl] // num_teams for lvl in by_level}
+    per_level_high = {
+        lvl: per_level_low[lvl] + (1 if (per_level_totals[lvl] % num_teams) > 0 else 0)
+        for lvl in by_level
+    }
+
+    def choose_team_for_level(level):
+        # Primary: fewer players of this level
+        # Secondary: fewer total players (respect capacities)
+        # Tertiary: balance sums (for strong players prefer higher sum; for weak prefer lower sum)
+        sum_key_sign = -1 if level in (1, 2) else 1
+        candidates = [i for i in range(num_teams) if team_sizes[i] < capacities[i]]
+        # Random component to avoid systemic bias
+        rands = {i: random.random() for i in candidates}
+        def key(i):
+            return (
+                per_level_counts[i][level],
+                team_sizes[i],
+                sum_key_sign * team_sums[i],
+                rands[i]
+            )
+        candidates.sort(key=key)
+        return candidates[0]
+
+    # Distribute by levels in ascending strength order ensures bucket fairness first
+    for level in [1, 2, 3, 4]:
+        while by_level[level]:
+            team_idx = choose_team_for_level(level)
+            player = by_level[level].pop()
+            teams[team_idx].append(player)
+            team_sizes[team_idx] += 1
+            team_sums[team_idx] += player[1]
+            per_level_counts[team_idx][level] += 1
+
+    # Local swap post-processing to reduce spread of sums while respecting per-level bounds
+    def within_level_bounds(team_idx, level, delta):
+        new_count = per_level_counts[team_idx][level] + delta
+        return per_level_low[level] <= new_count <= per_level_high[level]
+
+    def try_improve_with_swaps(max_iterations=100):
+        for _ in range(max_iterations):
+            improved = False
+            pre_spread = max(team_sums) - min(team_sums)
+            for i in range(num_teams):
+                for j in range(i + 1, num_teams):
+                    for a_idx, a in enumerate(teams[i]):
+                        for b_idx, b in enumerate(teams[j]):
+                            if a[1] == b[1]:
+                                continue  # swapping equal levels does not change sums
+                            # Check per-level bounds if swapped
+                            ai, bi = a[1], b[1]
+                            if not (within_level_bounds(i, ai, -1) and within_level_bounds(j, ai, +1)):
+                                continue
+                            if not (within_level_bounds(j, bi, -1) and within_level_bounds(i, bi, +1)):
+                                continue
+                            new_si = team_sums[i] - ai + bi
+                            new_sj = team_sums[j] - bi + ai
+                            new_sums = team_sums[:]
+                            new_sums[i] = new_si
+                            new_sums[j] = new_sj
+                            new_spread = max(new_sums) - min(new_sums)
+                            if new_spread < pre_spread:
+                                # Apply swap
+                                teams[i][a_idx], teams[j][b_idx] = teams[j][b_idx], teams[i][a_idx]
+                                team_sums[i], team_sums[j] = new_si, new_sj
+                                per_level_counts[i][ai] -= 1
+                                per_level_counts[i][bi] += 1
+                                per_level_counts[j][bi] -= 1
+                                per_level_counts[j][ai] += 1
+                                improved = True
+                                break
+                        if improved:
+                            break
+                    if improved:
+                        break
+            if not improved:
+                return
+
+    try_improve_with_swaps()
+    return teams
+
+
+def generate_balanced_teams(jogadores, num_times=3):
+    """Public helper to generate teams for testing/use without printing/logging."""
+    return _build_balanced_teams(jogadores, num_times)
+
+
+def sortear_times(jogadores, num_times=3):
+    """Create balanced teams with capacity constraints and post-processing.
+    Keeps existing logs and output formatting.
+    """
+    logging.info("Starting team balancing with %d players.", len(jogadores))
+    
     total_jogadores = len(jogadores)
     if total_jogadores < 15:
         logging.error("Insufficient players. Found %d, minimum required is 15.", total_jogadores)
         return
-
-    base_capacity = total_jogadores // num_times
-    extras = total_jogadores % num_times
-    capacities = [base_capacity] * num_times
-    for i in range(extras):
-        capacities[i] += 1
-    idx = list(range(num_times))
-    random.shuffle(idx)
-    capacities = [capacities[i] for i in idx]
-
-    jogadores_shuffled = jogadores[:]
-    random.shuffle(jogadores_shuffled)
-    player_names = [j[0] for j in jogadores_shuffled]
-    player_levels = [int(j[1]) for j in jogadores_shuffled]
-    player_types = [j[2] for j in jogadores_shuffled]
-
-    model = pulp.LpProblem("Team_Sorting", pulp.LpMinimize)
-
-    x = pulp.LpVariable.dicts("x", ((i, t) for i in range(total_jogadores) for t in range(num_times)), cat='Binary')
-
-    for i in range(total_jogadores):
-        model += pulp.lpSum([x[(i, t)] for t in range(num_times)]) == 1
-
-    for t in range(num_times):
-        model += pulp.lpSum([x[(i, t)] for i in range(total_jogadores)]) == capacities[t]
-
-    team_sums = [pulp.lpSum([player_levels[i] * x[(i, t)] for i in range(total_jogadores)]) for t in range(num_times)]
-
-    z = pulp.LpVariable("z", lowBound=0, upBound=sum(player_levels), cat='Continuous')
-    for t1 in range(num_times):
-        for t2 in range(num_times):
-            model += team_sums[t1] - team_sums[t2] <= z
-
-    total_level_sum = sum(player_levels)
-    target_sum_floor = total_level_sum // num_times
-    dist_vars = []
-    for t in range(num_times):
-        dist_pos = pulp.LpVariable(f"dist_pos_{t}", lowBound=0, upBound=total_level_sum, cat='Continuous')
-        dist_neg = pulp.LpVariable(f"dist_neg_{t}", lowBound=0, upBound=total_level_sum, cat='Continuous')
-        dist_abs = pulp.LpVariable(f"dist_abs_{t}", lowBound=0, upBound=total_level_sum, cat='Continuous')
-        model += team_sums[t] - target_sum_floor == dist_pos - dist_neg
-        model += dist_abs == dist_pos + dist_neg
-        dist_vars.append(dist_abs)
-
-    # Soft per-level distribution penalty
-    level_to_indices = {}
-    for i, lvl in enumerate(player_levels):
-        level_to_indices.setdefault(lvl, []).append(i)
-
-    level_dev_vars = []
-    for lvl, indices in level_to_indices.items():
-        total_lvl = len(indices)
-        target_per_team = total_lvl / num_times
-        for t in range(num_times):
-            cnt_t_lvl = pulp.lpSum([x[(i, t)] for i in indices])
-            dev_pos = pulp.LpVariable(f"lvl{lvl}_dev_pos_t{t}", lowBound=0, upBound=total_lvl, cat='Continuous')
-            dev_neg = pulp.LpVariable(f"lvl{lvl}_dev_neg_t{t}", lowBound=0, upBound=total_lvl, cat='Continuous')
-            dev_abs = pulp.LpVariable(f"lvl{lvl}_dev_abs_t{t}", lowBound=0, upBound=total_lvl, cat='Continuous')
-            # cnt_t_lvl - target == dev_pos - dev_neg
-            model += cnt_t_lvl - target_per_team == dev_pos - dev_neg
-            model += dev_abs == dev_pos + dev_neg
-            level_dev_vars.append(dev_abs)
-
-    BIG_W = 1000
-    alpha_level_dist, level_counts = _compute_alpha_level_dist(player_levels, num_times, total_jogadores)
-    logging.info("Alpha for level distribution penalty: %.2f | counts per level: %s", alpha_level_dist, level_counts)
-    model += BIG_W * z + pulp.lpSum(dist_vars) + alpha_level_dist * pulp.lpSum(level_dev_vars)
-
-    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=5, threads=8)
-
-    status = solver.solve(model)
-    if status != pulp.LpStatusOptimal and status != pulp.LpStatusFeasible:
-        logging.error("Solver did not find a solution.")
+    if total_jogadores > 18:
+        logging.error("Too many players. Found %d, maximum allowed is 18.", total_jogadores)
         return
-
-    teams = [[] for _ in range(num_times)]
-    for i in range(total_jogadores):
-        for t in range(num_times):
-            if pulp.value(x[(i, t)]) == 1:
-                teams[t].append((player_names[i], player_levels[i], player_types[i]))
-                break
-
-    for t in range(num_times):
-        random.shuffle(teams[t])
-
-    logging.info("Computed team averages:")
+    
+    teams = _build_balanced_teams(jogadores, num_times)
+    
+    # Shuffle team order and players within teams for randomness (presentation only)
+    random.shuffle(teams)
+    for team in teams:
+        random.shuffle(team)
+    
+    # Log team statistics (unchanged)
+    logging.info("Team balancing completed.")
+    logging.info("Team composition:")
     for i, team in enumerate(teams):
         if len(team) > 0:
             total_sum = sum(p[1] for p in team)
@@ -202,28 +229,44 @@ def sortear_times(jogadores, num_times=3):
                 logging.info("Team %d player: %s | Level: %d | Type: %s", i + 1, name, level, ptype)
         else:
             logging.info("Team %d: No players", i + 1)
-
+    
+    # Print formatted output (unchanged)
     print("*🐍⚽ Kobra FC | Sorteio dos Times*")
     print("_🤖 Sorteio Automatizado por Bot, com nivelamento para equilibrar os times. 🤖_\n")
     cores = ["🔴 *Time Vermelho*", "⚪ *Time Branco*", "🐍⚫🔵 *Time Kobra/Preto/Azul*"]
-
+    
     for i, team in enumerate(teams):
         print(f"{cores[i]}")
         for j, (jogador, nivel, tipo) in enumerate(team):
             status_emoji = "✅" if tipo == "Mensalista" else "✖️"
             print(f"{j + 1}. {jogador} {status_emoji}")
         print()
-
+    
     print("\n_ℹ Após realizar o pagamento, copie a mensagem acima e coloque um ✅ a frente do seu nome. Os times que pagarem primeiro começam jogando._\n")
     print("*FAVOR PAGAR ANTES DO INÍCIO DA PELADA!*\n")
     print("_Mensalista: 💵 R$ 80,00 na primeira pelada do mês_")
     print("_Avulso: 💵 R$ 23,00_")
     print("_Pix: 12685405607_")
 
-# Chamada da função com o nome do arquivo
-jogadores = processar_lista_jogadores('lista.txt')
-print(jogadores)
-if len(jogadores) >= 15:
-    sortear_times(jogadores)
-else:
-    logging.error(f"Jogadores insuficientes. Apenas {len(jogadores)} encontrados. Mínimo de 15 jogadores necessário.")
+if __name__ == '__main__':
+    # Autenticação com a conta de serviço e leitura da planilha
+    SCOPES = [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive'
+    ]
+    creds = Credentials.from_service_account_file('lofty-mark-407721-c78e211dcebf.json', scopes=SCOPES)
+    client = gspread.authorize(creds)
+    spreadsheet = client.open_by_key('1GRC7L_2Q75OEywLz-gFU6jrcKLhpgA3-1LZ_qFviFsY')
+    sheet = spreadsheet.get_worksheet(2)  # A terceira aba
+    data = sheet.get_all_records(expected_headers=expected_headers)
+    logging.debug("Dados da planilha carregados com sucesso com expected_headers.")
+
+    # Chamada da função com o nome do arquivo
+    jogadores = processar_lista_jogadores('lista.txt')
+    print(jogadores)
+    if 15 <= len(jogadores) <= 18:
+        sortear_times(jogadores)
+    elif len(jogadores) < 15:
+        logging.error(f"Jogadores insuficientes. Apenas {len(jogadores)} encontrados. Mínimo de 15 jogadores necessário.")
+    else:
+        logging.error("Too many players for a 3-team draw. Found %d (max 18).", len(jogadores))

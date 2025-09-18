@@ -2,18 +2,20 @@ Mensalistas:
 01. Guimma
 02. Gazolla
 03. Ian
-04. Dani Elmo
+04. Cici
 05. Gazolla 2
-06. Guedes
-07. Stoch
+06. Lopes
+07. Donato
 08. Egeu
 09. Guguta
-10. Tene
-11. Lopes
-12. Donato
-13. Thiago
-14. Billy
-15. Zito
-16. Basilio
-17. Rafa
-18. Yuji
+10. Enrico M
+11. Carioca
+12. Tusão
+
+Avulsos:
+13. Canjica
+14. Diego
+15. Basilio
+16. André
+17. Zito
+18. yuji
