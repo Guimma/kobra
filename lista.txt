@@ -1,21 +1,18 @@
-Mensalistas:
-01. Guimma
+01. Tusão
 02. Gazolla
 03. Ian
-04. Cici
-05. Gazolla 2
+04. Tene
+05. Bonato
 06. Lopes
-07. Donato
+07. Stoch
 08. Egeu
 09. Guguta
 10. Enrico M
-11. Carioca
-12. Tusão
-
-Avulsos:
-13. Canjica
-14. Diego
-15. Basilio
-16. André
-17. Zito
-18. yuji
+11. Guedes
+12. Guimma
+13. Diogo
+14. Gazolla 2
+15. Danilo
+16. Braga
+17. bode
+18. Pdr

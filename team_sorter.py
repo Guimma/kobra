@@ -4,6 +4,11 @@ import re
 import logging
 import random
 import pulp
+import sys
+
+# Configure UTF-8 encoding for console output (fixes emoji display on Windows)
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8')
 
 # Configuração do logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -85,109 +90,122 @@ def _compute_team_capacities(total_players, num_teams):
 
 
 def _build_balanced_teams(players, num_teams=3):
-    """Build teams with capacity constraints and per-level distribution.
+    """Build optimally balanced teams using Integer Linear Programming.
 
     Players are tuples: (name, level:int [1(best)-4(worst)], type)
-    Returns a list of teams (each a list of players), without printing or logging.
+    Returns a list of teams (each a list of players).
+    
+    This uses ILP to guarantee mathematically optimal team balance by minimizing
+    the spread (difference between highest and lowest team totals).
     """
     total_players = len(players)
     capacities = _compute_team_capacities(total_players, num_teams)
+    
+    # Create the optimization problem
+    prob = pulp.LpProblem("TeamBalancing", pulp.LpMinimize)
+    
+    # Decision variables: x[i][t] = 1 if player i is assigned to team t
+    player_indices = range(len(players))
+    team_indices = range(num_teams)
+    
+    x = pulp.LpVariable.dicts(
+        "assign",
+        ((i, t) for i in player_indices for t in team_indices),
+        cat='Binary'
+    )
+    
+    # Auxiliary variables for team sums
+    team_sums = pulp.LpVariable.dicts(
+        "team_sum",
+        team_indices,
+        lowBound=0,
+        cat='Continuous'
+    )
+    
+    # Variables for max and min team sums
+    max_sum = pulp.LpVariable("max_sum", lowBound=0, cat='Continuous')
+    min_sum = pulp.LpVariable("min_sum", lowBound=0, cat='Continuous')
+    
+    # Objective: minimize the spread (max_sum - min_sum)
+    prob += max_sum - min_sum, "Minimize_Spread"
+    
+    # Constraint 1: Each player assigned to exactly one team
+    for i in player_indices:
+        prob += pulp.lpSum([x[(i, t)] for t in team_indices]) == 1, f"Player_{i}_Assignment"
+    
+    # Constraint 2: Team size constraints (respect capacities)
+    for t in team_indices:
+        prob += pulp.lpSum([x[(i, t)] for i in player_indices]) == capacities[t], f"Team_{t}_Size"
+    
+    # Constraint 3: Define team sums based on player levels
+    for t in team_indices:
+        prob += (
+            team_sums[t] == pulp.lpSum([x[(i, t)] * players[i][1] for i in player_indices]),
+            f"Team_{t}_Sum_Definition"
+        )
+    
+    # Constraint 4: max_sum >= all team sums
+    for t in team_indices:
+        prob += max_sum >= team_sums[t], f"Max_Sum_Bound_{t}"
+    
+    # Constraint 5: min_sum <= all team sums
+    for t in team_indices:
+        prob += min_sum <= team_sums[t], f"Min_Sum_Bound_{t}"
+    
+    # Solve the problem (suppress solver output)
+    prob.solve(pulp.PULP_CBC_CMD(msg=0))
+    
+    # Check if solution was found
+    if prob.status != pulp.LpStatusOptimal:
+        logging.warning(
+            "ILP solver did not find optimal solution. Status: %s. Falling back to heuristic.",
+            pulp.LpStatus[prob.status]
+        )
+        # Fallback to simple round-robin if ILP fails
+        return _build_teams_fallback(players, num_teams, capacities)
+    
+    # Extract the solution
+    teams = [[] for _ in range(num_teams)]
+    for i in player_indices:
+        for t in team_indices:
+            if pulp.value(x[(i, t)]) == 1:
+                teams[t].append(players[i])
+                break
+    
+    logging.debug(
+        "ILP solution found with spread: %.2f (max: %.2f, min: %.2f)",
+        pulp.value(max_sum - min_sum),
+        pulp.value(max_sum),
+        pulp.value(min_sum)
+    )
+    
+    return teams
 
+
+def _build_teams_fallback(players, num_teams, capacities):
+    """Simple fallback method if ILP fails (should rarely happen).
+    
+    Uses a round-robin assignment sorted by level to ensure basic balance.
+    """
+    logging.warning("Using fallback team assignment method")
+    
+    # Sort players by level (best first) for better distribution
+    sorted_players = sorted(players, key=lambda p: p[1])
+    
     teams = [[] for _ in range(num_teams)]
     team_sizes = [0] * num_teams
-    team_sums = [0] * num_teams
-    per_level_counts = [{1: 0, 2: 0, 3: 0, 4: 0} for _ in range(num_teams)]
-
-    # Group players by level and shuffle within each bucket for randomness
-    by_level = {1: [], 2: [], 3: [], 4: []}
-    for p in players:
-        name, level, ptype = p
-        if level in by_level:
-            by_level[level].append(p)
-    for lvl in by_level:
-        random.shuffle(by_level[lvl])
-
-    # Target per-level distribution bounds for swap constraints
-    per_level_totals = {lvl: len(by_level[lvl]) for lvl in by_level}
-    per_level_low = {lvl: per_level_totals[lvl] // num_teams for lvl in by_level}
-    per_level_high = {
-        lvl: per_level_low[lvl] + (1 if (per_level_totals[lvl] % num_teams) > 0 else 0)
-        for lvl in by_level
-    }
-
-    def choose_team_for_level(level):
-        # Primary: fewer players of this level
-        # Secondary: fewer total players (respect capacities)
-        # Tertiary: balance sums (for strong players prefer higher sum; for weak prefer lower sum)
-        sum_key_sign = -1 if level in (1, 2) else 1
-        candidates = [i for i in range(num_teams) if team_sizes[i] < capacities[i]]
-        # Random component to avoid systemic bias
-        rands = {i: random.random() for i in candidates}
-        def key(i):
-            return (
-                per_level_counts[i][level],
-                team_sizes[i],
-                sum_key_sign * team_sums[i],
-                rands[i]
-            )
-        candidates.sort(key=key)
-        return candidates[0]
-
-    # Distribute by levels in ascending strength order ensures bucket fairness first
-    for level in [1, 2, 3, 4]:
-        while by_level[level]:
-            team_idx = choose_team_for_level(level)
-            player = by_level[level].pop()
-            teams[team_idx].append(player)
-            team_sizes[team_idx] += 1
-            team_sums[team_idx] += player[1]
-            per_level_counts[team_idx][level] += 1
-
-    # Local swap post-processing to reduce spread of sums while respecting per-level bounds
-    def within_level_bounds(team_idx, level, delta):
-        new_count = per_level_counts[team_idx][level] + delta
-        return per_level_low[level] <= new_count <= per_level_high[level]
-
-    def try_improve_with_swaps(max_iterations=100):
-        for _ in range(max_iterations):
-            improved = False
-            pre_spread = max(team_sums) - min(team_sums)
-            for i in range(num_teams):
-                for j in range(i + 1, num_teams):
-                    for a_idx, a in enumerate(teams[i]):
-                        for b_idx, b in enumerate(teams[j]):
-                            if a[1] == b[1]:
-                                continue  # swapping equal levels does not change sums
-                            # Check per-level bounds if swapped
-                            ai, bi = a[1], b[1]
-                            if not (within_level_bounds(i, ai, -1) and within_level_bounds(j, ai, +1)):
-                                continue
-                            if not (within_level_bounds(j, bi, -1) and within_level_bounds(i, bi, +1)):
-                                continue
-                            new_si = team_sums[i] - ai + bi
-                            new_sj = team_sums[j] - bi + ai
-                            new_sums = team_sums[:]
-                            new_sums[i] = new_si
-                            new_sums[j] = new_sj
-                            new_spread = max(new_sums) - min(new_sums)
-                            if new_spread < pre_spread:
-                                # Apply swap
-                                teams[i][a_idx], teams[j][b_idx] = teams[j][b_idx], teams[i][a_idx]
-                                team_sums[i], team_sums[j] = new_si, new_sj
-                                per_level_counts[i][ai] -= 1
-                                per_level_counts[i][bi] += 1
-                                per_level_counts[j][bi] -= 1
-                                per_level_counts[j][ai] += 1
-                                improved = True
-                                break
-                        if improved:
-                            break
-                    if improved:
-                        break
-            if not improved:
-                return
-
-    try_improve_with_swaps()
+    
+    for player in sorted_players:
+        # Find team with smallest size that hasn't reached capacity
+        candidates = [t for t in range(num_teams) if team_sizes[t] < capacities[t]]
+        if not candidates:
+            break
+        
+        # Assign to team with fewest players
+        team_idx = min(candidates, key=lambda t: team_sizes[t])
+        teams[team_idx].append(player)
+        team_sizes[team_idx] += 1
+    
     return teams
 
 
