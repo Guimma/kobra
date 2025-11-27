@@ -97,7 +97,13 @@ def _build_balanced_teams(players, num_teams=3):
     
     This uses ILP to guarantee mathematically optimal team balance by minimizing
     the spread (difference between highest and lowest team totals).
+    Randomizes player order before optimization to ensure variety between runs.
     """
+    # Shuffle players to introduce randomness (especially for same-level players)
+    # This ensures different but equally optimal solutions on each run
+    players = players.copy()  # Don't modify the original list
+    random.shuffle(players)
+    
     total_players = len(players)
     capacities = _compute_team_capacities(total_players, num_teams)
     
