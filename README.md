@@ -49,6 +49,14 @@ The script parses nicknames from lines like:
 ```
 Two digits, a dot, a space, then the nickname. One player per line.
 
+To force a player into a specific team color, add the color in brackets at the end of the line:
+```
+05. Egeu [Vermelho]
+06. Vini [Branco]
+07. Tene [Preto]
+```
+Accepted colors: `vermelho`/`v`, `branco`/`b`, `preto`/`azul`/`kobra`/`p`/`k` (case-insensitive). The remaining players are balanced around the fixed ones. When any color is fixed, team colors are no longer shuffled.
+
 ## Running
 ```powershell
 python team_sorter.py
